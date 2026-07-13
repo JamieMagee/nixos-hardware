@@ -24,9 +24,8 @@ let
 
   # install-rpi-firmware <target-dir>
   # Idempotent: copies via temp file + rename, and prunes stale DTBs/overlays.
-  installScript = pkgs.writeShellApplication {
+  installScriptArgs = {
     name = "install-rpi-firmware";
-    runtimeInputs = [ pkgs.coreutils ];
     text = ''
       target="$1"
       shopt -s nullglob
@@ -99,6 +98,19 @@ let
       echo "rpi-firmware: done ($target)"
     '';
   };
+
+  mkInstallScript =
+    scriptPkgs:
+    scriptPkgs.writeShellApplication (
+      installScriptArgs
+      // {
+        runtimeInputs = [ scriptPkgs.coreutils ];
+      }
+    );
+
+  # Target tools for activation, build tools for images.
+  installScript = mkInstallScript pkgs;
+  imageInstallScript = mkInstallScript pkgs.buildPackages;
 in
 {
   options.hardware.raspberry-pi.firmware = {
@@ -189,7 +201,7 @@ in
     # sd-image module is imported. mkForce so we override (not merge with)
     # sd-image-aarch64.nix, which also sets this and would clobber config.txt.
     (lib.optionalAttrs (options ? sdImage) {
-      sdImage.populateFirmwareCommands = lib.mkForce "${lib.getExe installScript} ./firmware\n";
+      sdImage.populateFirmwareCommands = lib.mkForce "${lib.getExe imageInstallScript} ./firmware\n";
     })
     (lib.mkIf cfg.enable {
       system.activationScripts.raspberry-pi-firmware = lib.stringAfter [ "specialfs" ] ''
