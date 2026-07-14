@@ -2,8 +2,8 @@
 #
 # Stages the files the Pi needs before Linux starts onto the firmware partition
 # (default /boot/firmware): GPU boot code (bootcode.bin, start*.elf, fixup*.dat),
-# vendor device trees and overlays, the rendered config.txt, and optionally
-# U-Boot. Not a new boot method: boards still use
+# kernel-matched device trees and overlays, the rendered config.txt, and
+# optionally U-Boot. Not a new boot method: boards still use
 # boot.loader.generic-extlinux-compatible (U-Boot reads extlinux.conf); this just
 # provides the files that path needs, either at SD-image build time
 # (sdImage.populateFirmwareCommands, wired automatically) or on a running system
@@ -21,80 +21,360 @@
 
 let
   cfg = config.hardware.raspberry-pi.firmware;
+  configTxtCfg = config.hardware.raspberry-pi.configtxt;
+  kernel = config.boot.kernelPackages.kernel;
+  defaultDeviceTreeSource = "${kernel}/dtbs";
+  defaultUboot = pkgs.buildUBoot {
+    defconfig = "rpi_arm64_defconfig";
+    extraMeta.platforms = [ "aarch64-linux" ];
+    filesToInstall = [ "u-boot.bin" ];
+  };
+  kernelOverlayReadme =
+    if toString cfg.deviceTree.source == defaultDeviceTreeSource && kernel ? src then
+      "${kernel.src}/arch/arm/boot/dts/overlays/README"
+    else
+      null;
 
-  # install-rpi-firmware <target-dir>
-  # Idempotent: copies via temp file + rename, and prunes stale DTBs/overlays.
+  hasSource = overlay: overlay.dtsText != null || overlay.dtsFile != null || overlay.dtboFile != null;
+
+  compileOverlay =
+    overlay:
+    if overlay.dtboFile != null then
+      overlay.dtboFile
+    else
+      pkgs.buildPackages.deviceTree.compileDTS {
+        name = "${overlay.name}-dtbo";
+        dtsFile =
+          if overlay.dtsFile != null then
+            overlay.dtsFile
+          else
+            pkgs.buildPackages.writeText "${overlay.name}.dts" overlay.dtsText;
+        includePaths = [
+          "${lib.getDev kernel}/lib/modules/${kernel.modDirVersion}/source/scripts/dtc/include-prefixes"
+        ]
+        ++ config.hardware.deviceTree.dtboBuildExtraIncludePaths;
+        extraPreprocessorFlags = config.hardware.deviceTree.dtboBuildExtraPreprocessorFlags;
+      };
+
+  customOverlays = map (overlay: {
+    inherit (overlay) name;
+    file = compileOverlay overlay;
+  }) (lib.filter hasSource configTxtCfg.overlays);
+
+  firmwareBundle =
+    pkgs.buildPackages.runCommand "raspberry-pi-firmware"
+      {
+        nativeBuildInputs = [ pkgs.buildPackages.dtc ];
+      }
+      ''
+        export LC_ALL=C
+        shopt -s nullglob
+        mkdir -p "$out/files/overlays"
+        declare -A bundlePaths
+        declare -A mappedOverlayNames
+        declare -A stockOverlayNames
+
+        copyUnique() {
+          local src="$1"
+          local dst="$2"
+          local path
+          local key
+
+          path="''${dst#"$out/files/"}"
+          key="''${path,,}"
+          if [ -n "''${bundlePaths[$key]+x}" ]; then
+            echo "rpi-firmware: bundle path collision: $path" >&2
+            exit 1
+          fi
+
+          mkdir -p "$(dirname "$dst")"
+          cp -- "$src" "$dst"
+          bundlePaths["$key"]="$path"
+        }
+
+        dtbSource=${lib.escapeShellArg (toString cfg.deviceTree.source)}
+        dtbCount=0
+        for src in "$dtbSource"/*.dtb "$dtbSource"/broadcom/*.dtb; do
+          copyUnique "$src" "$out/files/$(basename "$src")"
+          dtbCount=$((dtbCount + 1))
+        done
+
+        if [ "$dtbCount" -eq 0 ]; then
+          echo "rpi-firmware: no base DTBs found in $dtbSource" >&2
+          exit 1
+        fi
+
+        if [ -d "$dtbSource/overlays" ]; then
+          for src in "$dtbSource"/overlays/*; do
+            [ -f "$src" ] || continue
+            copyUnique "$src" "$out/files/overlays/$(basename "$src")"
+          done
+        fi
+
+        if [ ! -f "$out/files/overlays/README" ]; then
+          ${
+            if kernelOverlayReadme != null then
+              ''
+                if [ ! -f ${lib.escapeShellArg kernelOverlayReadme} ]; then
+                  echo "rpi-firmware: overlay README not found" >&2
+                  exit 1
+                fi
+                copyUnique ${lib.escapeShellArg kernelOverlayReadme} "$out/files/overlays/README"
+              ''
+            else
+              ''
+                echo "rpi-firmware: overlay README not found in the device-tree source" >&2
+                exit 1
+              ''
+          }
+        fi
+
+        for path in overlays/README overlays/overlay_map.dtb overlays/hat_map.dtb; do
+          if [ ! -f "$out/files/$path" ]; then
+            echo "rpi-firmware: required device-tree file not found: $path" >&2
+            exit 1
+          fi
+        done
+
+        for src in "$out/files/overlays"/*.dtbo; do
+          name="$(basename "$src" .dtbo)"
+          stockOverlayNames["''${name,,}"]="$name"
+        done
+        mapNames="$TMPDIR/overlay-map-names"
+        if ! fdtget -l "$out/files/overlays/overlay_map.dtb" / > "$mapNames"; then
+          echo "rpi-firmware: failed to read overlays/overlay_map.dtb" >&2
+          exit 1
+        fi
+        while IFS= read -r name; do
+          [ -n "$name" ] || continue
+          mappedOverlayNames["$name"]=1
+          stockOverlayNames["''${name,,}"]="$name"
+        done < "$mapNames"
+
+        copyCustomOverlay() {
+          local name="$1"
+          local src="$2"
+          local key="''${name,,}"
+
+          if [ -n "''${stockOverlayNames[$key]+x}" ]; then
+            echo "rpi-firmware: custom overlay conflicts with stock overlay: $name" >&2
+            exit 1
+          fi
+          copyUnique "$src" "$out/files/overlays/$name.dtbo"
+        }
+
+        ${lib.concatMapStringsSep "\n" (overlay: ''
+          copyCustomOverlay ${lib.escapeShellArg overlay.name} ${lib.escapeShellArg (toString overlay.file)}
+        '') customOverlays}
+
+        firmwareBoot=${lib.escapeShellArg "${cfg.package}/share/raspberrypi/boot"}
+        startFiles=("$firmwareBoot"/start*.elf)
+        fixupFiles=("$firmwareBoot"/fixup*.dat)
+        if [ ! -f "$firmwareBoot/bootcode.bin" ] || [ "''${#startFiles[@]}" -eq 0 ] || [ "''${#fixupFiles[@]}" -eq 0 ]; then
+          echo "rpi-firmware: firmware package is missing bootcode.bin, start*.elf, or fixup*.dat" >&2
+          exit 1
+        fi
+        for src in "''${startFiles[@]}"; do
+          suffix="$(basename "$src")"
+          suffix="''${suffix#start}"
+          suffix="''${suffix%.elf}"
+          if [ ! -f "$firmwareBoot/fixup$suffix.dat" ]; then
+            echo "rpi-firmware: firmware package has no fixup$suffix.dat for $(basename "$src")" >&2
+            exit 1
+          fi
+        done
+        for src in "''${fixupFiles[@]}"; do
+          suffix="$(basename "$src")"
+          suffix="''${suffix#fixup}"
+          suffix="''${suffix%.dat}"
+          if [ ! -f "$firmwareBoot/start$suffix.elf" ]; then
+            echo "rpi-firmware: firmware package has no start$suffix.elf for $(basename "$src")" >&2
+            exit 1
+          fi
+        done
+        for src in "$firmwareBoot/bootcode.bin" "''${startFiles[@]}" "''${fixupFiles[@]}"; do
+          copyUnique "$src" "$out/files/$(basename "$src")"
+        done
+
+        ${lib.optionalString cfg.uboot.enable ''
+          copyUnique ${lib.escapeShellArg "${cfg.uboot.package}/u-boot.bin"} "$out/files/u-boot.bin"
+        ''}
+
+        copyUnique ${lib.escapeShellArg (toString configTxtCfg.file)} "$out/files/config.txt"
+
+        while IFS= read -r overlay; do
+          [ -n "$overlay" ] || continue
+          path="overlays/$overlay.dtbo"
+          key="''${path,,}"
+          if [ -z "''${bundlePaths[$key]+x}" ] && [ -z "''${mappedOverlayNames[$overlay]+x}" ]; then
+            echo "rpi-firmware: config.txt references missing overlay: $overlay" >&2
+            exit 1
+          fi
+        done < <(sed -nE 's/^[[:space:]]*(dtoverlay|device_tree_overlay)[[:space:]]*=[[:space:]]*([^,[:space:]#]*).*/\2/p' "$out/files/config.txt")
+
+        (cd "$out/files" && find . -type f -printf '%P\n' | LC_ALL=C sort) > "$out/manifest"
+      '';
+
+  # install-rpi-firmware <bundle> <target-dir>
   installScriptArgs = {
     name = "install-rpi-firmware";
     text = ''
-      target="$1"
-      shopt -s nullglob
+      export LC_ALL=C
+      bundle="$1"
+      logicalTarget="$(realpath -sm -- "$2")"
+      resolvedTarget="$(realpath -m -- "$2")"
+      if [ "$logicalTarget" != "$resolvedTarget" ]; then
+        echo "rpi-firmware: target path must not contain symbolic links: $2" >&2
+        exit 1
+      fi
+      target="$logicalTarget"
+      files="$bundle/files"
+      newManifest="$bundle/manifest"
+      targetManifest="$target/.nixos-hardware-raspberry-pi.manifest"
 
-      firmwareBoot=${cfg.package}/share/raspberrypi/boot
-      ${
-        if cfg.useGenerationDeviceTree then
-          ''
-            # Prefer the booted generation's device trees over the vendor ones.
-            dtbSrc=/run/current-system/dtbs
-            [ -d "$dtbSrc" ] || dtbSrc=$firmwareBoot
-          ''
-        else
-          ''
-            dtbSrc=$firmwareBoot
-          ''
-      }
+      declare -A oldPaths
+      declare -A newPaths
 
-      mkdir -p "$target/overlays"
+      validatePath() {
+        local path="$1"
+        local part
+        local -a parts
 
-      # Copy via a temp file then rename so an interrupted run can't leave a
-      # half-written file behind. The firmware partition is FAT, so the rename
-      # isn't truly atomic, but it still beats a partial copy when the
-      # activation script rewrites the partition on a live system.
-      copyForced() {
-        cp "$1" "$2.tmp"
-        mv "$2.tmp" "$2"
-      }
-
-      # Track every file we copy this run, keyed by destination path, so the
-      # prune step below can delete stale device trees / overlays left behind
-      # by a previous generation.
-      declare -A kept
-
-      echo "rpi-firmware: copying device trees from $dtbSrc"
-      for dtb in "$dtbSrc"/*.dtb "$dtbSrc"/broadcom/*.dtb; do
-        dst="$target/$(basename "$dtb")"
-        copyForced "$dtb" "$dst"
-        kept[$dst]=1
-      done
-
-      if [ -d "$dtbSrc/overlays" ]; then
-        for ovr in "$dtbSrc"/overlays/*; do
-          dst="$target/overlays/$(basename "$ovr")"
-          copyForced "$ovr" "$dst"
-          kept[$dst]=1
+        [ -n "$path" ] && [[ "$path" != /* ]] && [[ "$path" != *$'\r'* ]] || return 1
+        IFS=/ read -ra parts <<< "$path"
+        for part in "''${parts[@]}"; do
+          [ -n "$part" ] && [ "$part" != . ] && [ "$part" != .. ] || return 1
         done
+      }
+
+      loadManifest() {
+        local manifest="$1"
+        local requireFiles="$2"
+        local path
+        local key
+        local -n paths="$3"
+
+        while IFS= read -r path || [ -n "$path" ]; do
+          if ! validatePath "$path"; then
+            echo "rpi-firmware: invalid manifest path: $path" >&2
+            exit 1
+          fi
+          if [ "$requireFiles" = 1 ] && [ ! -f "$files/$path" ]; then
+            echo "rpi-firmware: bundle file missing: $path" >&2
+            exit 1
+          fi
+          key="''${path,,}"
+          if [ -n "''${paths[$key]+x}" ]; then
+            echo "rpi-firmware: case-insensitive manifest path collision: $path" >&2
+            exit 1
+          fi
+          # Assigned through a nameref and read by the caller.
+          # shellcheck disable=SC2034
+          paths["$key"]="$path"
+        done < "$manifest"
+      }
+
+      copyForced() {
+        local src="$1"
+        local dst="$2"
+        local dir
+        local base
+        local tmp
+
+        dir="$(dirname "$dst")"
+        base="$(basename "$dst")"
+        mkdir -p "$dir"
+        tmp="$(mktemp "$dir/.$base.nixos-hardware.XXXXXX")"
+        if ! cp -- "$src" "$tmp"; then
+          rm -f -- "$tmp"
+          return 1
+        fi
+        mv -- "$tmp" "$dst"
+      }
+
+      checkParents() {
+        local path="$1"
+        local parent
+
+        parent="$(dirname "$path")"
+        while [ "$parent" != . ]; do
+          if [ -L "$target/$parent" ] || { [ -e "$target/$parent" ] && [ ! -d "$target/$parent" ]; }; then
+            echo "rpi-firmware: parent path is not a directory: $parent" >&2
+            exit 1
+          fi
+          parent="$(dirname "$parent")"
+        done
+      }
+
+      loadManifest "$newManifest" 1 newPaths
+
+      hadOldManifest=false
+      if [ -L "$targetManifest" ] || { [ -e "$targetManifest" ] && [ ! -f "$targetManifest" ]; }; then
+        echo "rpi-firmware: target manifest is not a regular file" >&2
+        exit 1
+      elif [ -f "$targetManifest" ]; then
+        hadOldManifest=true
+        loadManifest "$targetManifest" 0 oldPaths
+      else
+        echo "rpi-firmware: no previous manifest; unmanaged files will be kept" >&2
       fi
 
-      # Prune stale device trees / overlays.
-      for fn in "$target"/*.dtb "$target"/overlays/*; do
-        if [ "''${kept[$fn]:-}" != 1 ]; then
-          rm -v -- "$fn"
+      # Check every collision and parent directory before changing the target.
+      while IFS= read -r path || [ -n "$path" ]; do
+        dst="$target/$path"
+        key="''${path,,}"
+        checkParents "$path"
+
+        if [ -L "$dst" ] || { [ -e "$dst" ] && [ ! -f "$dst" ]; }; then
+          echo "rpi-firmware: target path is not a regular file: $path" >&2
+          exit 1
         fi
-      done
 
-      echo "rpi-firmware: copying GPU boot code"
-      for src in "$firmwareBoot"/bootcode.bin "$firmwareBoot"/start*.elf "$firmwareBoot"/fixup*.dat; do
-        copyForced "$src" "$target/$(basename "$src")"
-      done
+        if [ "$hadOldManifest" = true ] && [ -n "''${oldPaths[$key]+x}" ] && [ "''${oldPaths[$key]}" != "$path" ]; then
+          echo "rpi-firmware: case-only path change is not supported: ''${oldPaths[$key]} -> $path" >&2
+          exit 1
+        fi
 
-      ${lib.optionalString cfg.uboot.enable ''
-        echo "rpi-firmware: copying U-Boot"
-        copyForced ${cfg.uboot.package}/u-boot.bin "$target/u-boot.bin"
-      ''}
+        if [ -e "$dst" ] && [ "$hadOldManifest" = true ] && [ -z "''${oldPaths[$key]+x}" ]; then
+          if [ ! -f "$dst" ] || ! cmp -s "$files/$path" "$dst"; then
+            echo "rpi-firmware: unmanaged path collision: $path" >&2
+            exit 1
+          fi
+        fi
+      done < "$newManifest"
 
-      echo "rpi-firmware: copying config.txt"
-      copyForced ${config.hardware.raspberry-pi.configtxt.file} "$target/config.txt"
+      if [ "$hadOldManifest" = true ]; then
+        while IFS= read -r path || [ -n "$path" ]; do
+          key="''${path,,}"
+          if [ -z "''${newPaths[$key]+x}" ]; then
+            checkParents "$path"
+            if [ -L "$target/$path" ] || { [ -e "$target/$path" ] && [ ! -f "$target/$path" ]; }; then
+              echo "rpi-firmware: stale target path is not a regular file: $path" >&2
+              exit 1
+            fi
+          fi
+        done < "$targetManifest"
+      fi
 
+      mkdir -p "$target"
+      while IFS= read -r path || [ -n "$path" ]; do
+        [ "$path" = config.txt ] || copyForced "$files/$path" "$target/$path"
+      done < "$newManifest"
+
+      if [ -n "''${newPaths[config.txt]+x}" ]; then
+        copyForced "$files/config.txt" "$target/config.txt"
+      fi
+
+      if [ "$hadOldManifest" = true ]; then
+        while IFS= read -r path || [ -n "$path" ]; do
+          key="''${path,,}"
+          if [ -z "''${newPaths[$key]+x}" ]; then
+            rm -f -- "$target/$path"
+          fi
+        done < "$targetManifest"
+      fi
+
+      copyForced "$newManifest" "$targetManifest"
       echo "rpi-firmware: done ($target)"
     '';
   };
@@ -104,7 +384,10 @@ let
     scriptPkgs.writeShellApplication (
       installScriptArgs
       // {
-        runtimeInputs = [ scriptPkgs.coreutils ];
+        runtimeInputs = [
+          scriptPkgs.coreutils
+          scriptPkgs.diffutils
+        ];
       }
     );
 
@@ -139,8 +422,21 @@ in
       default = pkgs.raspberrypifw;
       defaultText = lib.literalExpression "pkgs.raspberrypifw";
       description = ''
-        Package providing the Raspberry Pi GPU boot code, vendor device trees,
-        and overlays under `''${package}/share/raspberrypi/boot`.
+        Package providing Raspberry Pi GPU boot code under
+        `''${package}/share/raspberrypi/boot`.
+      '';
+    };
+
+    deviceTree.source = lib.mkOption {
+      type = lib.types.path;
+      default = defaultDeviceTreeSource;
+      defaultText = lib.literalExpression ''"''${config.boot.kernelPackages.kernel}/dtbs"'';
+      description = ''
+        Raw device trees and overlays to install on the firmware partition.
+
+        The directory must contain base DTBs at its root or under `broadcom/`,
+        plus an `overlays/` directory containing compiled overlays and
+        `README`, `overlay_map.dtb`, and `hat_map.dtb`.
       '';
     };
 
@@ -156,32 +452,32 @@ in
 
       package = lib.mkOption {
         type = lib.types.package;
-        default = pkgs.ubootRaspberryPiAarch64;
-        defaultText = lib.literalExpression "pkgs.ubootRaspberryPiAarch64";
+        default = defaultUboot;
+        defaultText = lib.literalExpression ''
+          pkgs.buildUBoot {
+            defconfig = "rpi_arm64_defconfig";
+            extraMeta.platforms = [ "aarch64-linux" ];
+            filesToInstall = [ "u-boot.bin" ];
+          }
+        '';
         description = ''
           U-Boot package whose `u-boot.bin` is copied to the firmware
           partition when {option}`hardware.raspberry-pi.firmware.uboot.enable`
           is enabled.
 
-          The default, nixpkgs' `pkgs.ubootRaspberryPiAarch64`, covers the
+          The default uses nixpkgs' `rpi_arm64_defconfig`, which covers the
           64-bit boards (Pi 3/4/5). For a 32-bit board, override this with the
           matching U-Boot package.
         '';
       };
     };
 
-    useGenerationDeviceTree = lib.mkOption {
-      type = lib.types.bool;
-      default = false;
-      description = ''
-        Copy device trees from the booted NixOS generation
-        (`/run/current-system/dtbs`) instead of the vendor firmware package.
-        Irrelevant when generating an SD image.
-      '';
-    };
   };
 
   config = lib.mkMerge [
+    {
+      system.build.raspberryPiFirmware = firmwareBundle;
+    }
     (lib.mkIf cfg.uboot.enable {
       # Chainload U-Boot: the GPU firmware loads u-boot.bin, which then reads
       # extlinux.conf. mkDefault so an explicit kernel setting still wins.
@@ -196,17 +492,40 @@ in
       # U-Boot. The default (true) adds an FDTDIR line to extlinux.conf, so
       # U-Boot reloads bare dtbs and drops the overlays.
       boot.loader.generic-extlinux-compatible.useGenerationDeviceTree = lib.mkDefault false;
+
+      assertions = [
+        {
+          assertion = config.boot.loader.generic-extlinux-compatible.enable;
+          message = "Raspberry Pi managed U-Boot requires generic-extlinux-compatible.";
+        }
+        {
+          assertion = !config.boot.loader.generic-extlinux-compatible.useGenerationDeviceTree;
+          message = "Raspberry Pi managed U-Boot must preserve the firmware device tree.";
+        }
+      ];
+
+      warnings =
+        lib.optional
+          (
+            !config.boot.loader.generic-extlinux-compatible.useGenerationDeviceTree
+            && config.hardware.deviceTree.overlays != [ ]
+          )
+          ''
+            Raspberry Pi build-time device-tree overlays are ignored when U-Boot
+            preserves the firmware device tree. Use hardware.raspberry-pi.configtxt.overlays instead.
+          '';
     })
     # Stage the firmware partition at SD-image build time, only when an
     # sd-image module is imported. mkForce so we override (not merge with)
     # sd-image-aarch64.nix, which also sets this and would clobber config.txt.
     (lib.optionalAttrs (options ? sdImage) {
-      sdImage.populateFirmwareCommands = lib.mkForce "${lib.getExe imageInstallScript} ./firmware\n";
+      sdImage.populateFirmwareCommands = lib.mkForce "${lib.getExe imageInstallScript} ${firmwareBundle} ./firmware\n";
+      hardware.raspberry-pi.firmware.uboot.enable = lib.mkDefault pkgs.stdenv.hostPlatform.isAarch64;
     })
     (lib.mkIf cfg.enable {
       system.activationScripts.raspberry-pi-firmware = lib.stringAfter [ "specialfs" ] ''
         if mountpoint -q ${lib.escapeShellArg cfg.path}; then
-          ${lib.getExe installScript} ${lib.escapeShellArg cfg.path}
+          ${lib.getExe installScript} ${firmwareBundle} ${lib.escapeShellArg cfg.path}
         else
           echo "rpi-firmware: ${cfg.path} is not a mounted partition, skipping firmware install" >&2
         fi

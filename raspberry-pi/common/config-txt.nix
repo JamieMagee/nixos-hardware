@@ -38,6 +38,24 @@ let
         default = [ ];
         description = "Ordered config.txt conditional filters without brackets.";
       };
+
+      dtsText = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Literal DTS source to compile and install as `<name>.dtbo`.";
+      };
+
+      dtsFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = "DTS source file to compile and install as `<name>.dtbo`.";
+      };
+
+      dtboFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = "Precompiled overlay to install as `<name>.dtbo`.";
+      };
     };
   };
 
@@ -134,6 +152,22 @@ let
     overlay: lib.filter (filter: !validFilter filter) overlay.filters
   ) cfg.overlays;
   invalidParams = lib.concatMap (overlay: lib.filter hasLineBreak overlay.params) cfg.overlays;
+  sourceCount =
+    overlay:
+    lib.count (source: source != null) [
+      overlay.dtsText
+      overlay.dtsFile
+      overlay.dtboFile
+    ];
+  sourceNames = map (overlay: overlay.name) (
+    lib.filter (overlay: sourceCount overlay == 1) cfg.overlays
+  );
+  invalidSources = map (overlay: overlay.name) (
+    lib.filter (overlay: sourceCount overlay > 1) cfg.overlays
+  );
+  duplicateSources = lib.filter (name: lib.count (sourceName: sourceName == name) sourceNames > 1) (
+    lib.unique sourceNames
+  );
   longLines = lib.filter (line: builtins.stringLength line > 98) (
     lib.splitString "\n" generatedConfig
   );
@@ -193,7 +227,9 @@ in
 
         Entries are rendered after {option}`settings`. Each one writes its
         filters, `dtoverlay`, and `dtparam` values in order, then resets the
-        overlay scope.
+        overlay scope. Set one of `dtsText`, `dtsFile`, or `dtboFile` to
+        provide a custom overlay. An entry with no source uses a stock overlay
+        from {option}`hardware.raspberry-pi.firmware.deviceTree.source`.
       '';
       example = lib.literalExpression ''
         [
@@ -230,6 +266,14 @@ in
     {
       assertion = invalidParams == [ ];
       message = "Raspberry Pi config.txt overlay parameters contain line breaks: ${builtins.toJSON invalidParams}";
+    }
+    {
+      assertion = invalidSources == [ ];
+      message = "Raspberry Pi config.txt overlays have multiple sources: ${builtins.toJSON invalidSources}";
+    }
+    {
+      assertion = duplicateSources == [ ];
+      message = "Raspberry Pi config.txt overlays have duplicate source providers: ${builtins.toJSON duplicateSources}";
     }
     {
       assertion = cfg.overlays == [ ] || usesGeneratedFile;
